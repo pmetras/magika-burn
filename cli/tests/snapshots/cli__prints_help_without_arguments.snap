@@ -21,6 +21,7 @@ Options:
   -i, --mime-type               Print the MIME type (e.g. `application/x-rust`) instead of the description
   -s, --output-score            Append the score of the prediction
       --json                    Print a JSON array with the prediction and content type of each path
+  -j, --jobs <N>                Identify this many files at a time. Defaults to the number of processors
       --list-content-types      List all content types and exit. Combine with --json for JSON
   -h, --help                    Print help (see more with '--help')
   -V, --version                 Print version

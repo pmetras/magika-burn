@@ -180,6 +180,21 @@ fn recurses_into_directories() {
     insta::assert_snapshot!(magika(dir.path(), &args, b""));
 }
 
+/// Files are identified in parallel but printed in the order they were given, so
+/// that a run is reproducible however many of them there are.
+#[test]
+fn prints_in_the_order_of_the_paths() {
+    let dir = fixtures();
+    tree(dir.path());
+    let mut args = vec!["-r", "tree"];
+    args.extend_from_slice(ALL);
+    let serial = magika(dir.path(), &[&["-j", "1"], args.as_slice()].concat(), b"");
+    for jobs in ["2", "3", "8", "64"] {
+        let parallel = magika(dir.path(), &[&["-j", jobs], args.as_slice()].concat(), b"");
+        assert_eq!(parallel, serial, "-j {jobs} reordered the output");
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn follows_symbolic_links() {

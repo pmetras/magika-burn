@@ -149,6 +149,7 @@ missing.txt: error: No such file or directory (os error 2)
 | `-l`, `--label`                  | Print the label (`rust`) instead of the description                         |
 | `-i`, `--mime-type`              | Print the MIME type (`application/x-rust`) instead of the description       |
 | `-s`, `--output-score`           | Append the score                                                            |
+| `-j`, `--jobs <N>`               | Identify this many files at a time, by default one per processor            |
 | `--json`                         | Print a JSON array with the prediction and content type of each path        |
 | `--list-content-types`           | List all content types, as a table or with `--json` as JSON                 |
 
@@ -226,9 +227,13 @@ Identifying one file at a time on an Apple M3 Max:
 | magika-burn, WebAssembly in Bun 1.4      | ~18 ms        | ~26 MiB |
 
 Memory is the resident memory the WebAssembly module adds, including compiling
-it, as measured by `scripts/measure-wasm.mjs`. Upstream uses all cores; this
-port uses one per file. The WebAssembly module is 3.2 MB (3.0 MB gzipped), almost
-all of it weights: its code is 36 KiB.
+it, as measured by `scripts/measure-wasm.mjs`. The WebAssembly module is 3.2 MB
+(3.0 MB gzipped), almost all of it weights: its code is 36 KiB.
+
+The times above are for one file on one thread. `magika` identifies several at a
+time, one per processor by default and `--jobs` otherwise, and `Magika` is `Sync`,
+so one model can be shared by as many threads as you like. On x86-64 the model
+also picks a forward pass compiled for AVX2 and FMA when the processor has them.
 
 ## Development
 

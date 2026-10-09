@@ -4,8 +4,14 @@ use std::{
     borrow::Cow,
     fs::{self, File},
     io::{self, Read, Write},
+    num::NonZero,
     path::{Path, PathBuf},
     process::ExitCode,
+    sync::{
+        Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
+    thread,
 };
 
 use anyhow::Result;
@@ -57,6 +63,10 @@ struct Args {
     #[arg(long, conflicts_with_all = ["label", "mime_type", "output_score"])]
     json: bool,
 
+    /// Identify this many files at a time. Defaults to the number of processors.
+    #[arg(short = 'j', long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..))]
+    jobs: Option<u32>,
+
     /// List all content types and exit. Combine with --json for JSON.
     #[arg(
         long,
@@ -95,6 +105,15 @@ struct Entry {
     result: io::Result<Prediction>,
 }
 
+/// One unit of work, in output order.
+enum Job {
+    /// A path to identify, which any worker can do.
+    Path(PathBuf),
+    /// An entry that is already known: standard input, which only the main thread
+    /// reads, or a walk error.
+    Done(Entry),
+}
+
 fn main() -> ExitCode {
     let args = Args::parse();
     if args.paths.iter().filter(|path| is_stdin(path)).count() > 1 {
@@ -124,30 +143,99 @@ fn main() -> ExitCode {
 }
 
 /// Identifies and prints every path. Returns whether all of them were identified.
+///
+/// Identifying a file is a few milliseconds of arithmetic, so the files are spread
+/// over a pool of threads. They are printed in the order they were given, not the
+/// order they finish, which keeps the output of a run reproducible. The paths are
+/// therefore collected before any of them is identified, so a recursive run holds
+/// one `PathBuf` per file and prints nothing until the walk is over.
 fn run(args: &Args) -> Result<bool> {
     let magika = Magika::new().with_prediction_mode(args.prediction_mode.into());
     let mut output = Output::new(args);
-    for path in &args.paths {
-        if is_stdin(path) {
-            let result = read_stdin().map(|content| magika.identify_bytes(&content));
-            output.print(Entry {
-                path: path.clone(),
-                result,
-            })?;
-        } else if args.recursive {
-            for entry in walk(&magika, path, args.no_dereference) {
-                output.print(entry)?;
+
+    // Standard input is read here: it is a single stream, and reading it from a
+    // worker would race with the other workers for no gain.
+    let jobs: Vec<Job> = args
+        .paths
+        .iter()
+        .flat_map(|path| -> Box<dyn Iterator<Item = Job>> {
+            if is_stdin(path) {
+                let result = read_stdin().map(|content| magika.identify_bytes(&content));
+                Box::new(std::iter::once(Job::Done(Entry {
+                    path: path.clone(),
+                    result,
+                })))
+            } else if args.recursive {
+                Box::new(walk(path, args.no_dereference))
+            } else {
+                Box::new(std::iter::once(Job::Path(path.clone())))
             }
-        } else {
-            let result = identify_path(&magika, path, args.no_dereference);
-            output.print(Entry {
-                path: path.clone(),
-                result,
-            })?;
-        }
+        })
+        .collect();
+
+    for entry in identify_all(&magika, jobs, args) {
+        output.print(entry)?;
     }
     output.finish()?;
     Ok(output.all_identified)
+}
+
+/// Identifies every job, in parallel, and returns the entries in the order of the
+/// jobs.
+fn identify_all(magika: &Magika, jobs: Vec<Job>, args: &Args) -> Vec<Entry> {
+    let threads = args.jobs.map_or_else(
+        || thread::available_parallelism().map_or(1, NonZero::get),
+        |jobs| jobs as usize,
+    );
+    // One thread is this one, and threads beyond the number of paths idle.
+    let paths = jobs
+        .iter()
+        .filter(|job| matches!(job, Job::Path(_)))
+        .count();
+    if threads <= 1 || paths <= 1 {
+        return jobs
+            .into_iter()
+            .map(|job| match job {
+                Job::Path(path) => Entry {
+                    result: identify_path(magika, &path, args.no_dereference),
+                    path,
+                },
+                Job::Done(entry) => entry,
+            })
+            .collect();
+    }
+
+    // Each worker takes the next job that is a path, so that a slow file holds up
+    // only itself, and writes the entry back where the job was.
+    let entries: Vec<Mutex<Option<Entry>>> = jobs.iter().map(|_| Mutex::new(None)).collect();
+    let next = AtomicUsize::new(0);
+    thread::scope(|scope| {
+        for _ in 0..threads.min(paths) {
+            scope.spawn(|| {
+                loop {
+                    let index = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(job) = jobs.get(index) else { break };
+                    let Job::Path(path) = job else { continue };
+                    let entry = Entry {
+                        path: path.clone(),
+                        result: identify_path(magika, path, args.no_dereference),
+                    };
+                    *entries[index].lock().expect("no worker panics") = Some(entry);
+                }
+            });
+        }
+    });
+
+    jobs.into_iter()
+        .zip(entries)
+        .map(|(job, entry)| match job {
+            Job::Done(entry) => entry,
+            Job::Path(_) => entry
+                .into_inner()
+                .expect("no worker panics")
+                .expect("every path was identified"),
+        })
+        .collect()
 }
 
 /// Prints entries as they are identified: as text lines, or as the elements of
@@ -283,13 +371,10 @@ fn read_stdin() -> io::Result<Vec<u8>> {
     Ok(content)
 }
 
-/// Identifies the files under `path` (or `path` itself if it is not a directory),
-/// depth-first in name order.
-fn walk<'a>(
-    magika: &'a Magika,
-    path: &'a Path,
-    no_dereference: bool,
-) -> impl Iterator<Item = Entry> + 'a {
+/// The files under `path` (or `path` itself if it is not a directory), depth-first
+/// in name order. A walk error becomes a job holding it, so that it is reported in
+/// the position where the path would have been.
+fn walk<'a>(path: &'a Path, no_dereference: bool) -> impl Iterator<Item = Job> + 'a {
     WalkDir::new(path)
         .follow_links(!no_dereference)
         .follow_root_links(!no_dereference)
@@ -298,11 +383,8 @@ fn walk<'a>(
         .filter_map(move |entry| match entry {
             // Directories are walked, not identified.
             Ok(entry) if entry.file_type().is_dir() => None,
-            Ok(entry) => Some(Entry {
-                result: identify_path(magika, entry.path(), no_dereference),
-                path: entry.into_path(),
-            }),
-            Err(error) => Some(walk_error(error, path)),
+            Ok(entry) => Some(Job::Path(entry.into_path())),
+            Err(error) => Some(Job::Done(walk_error(error, path))),
         })
 }
 
