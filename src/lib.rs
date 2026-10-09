@@ -158,3 +158,27 @@ impl fmt::Debug for Magika {
             .finish_non_exhaustive()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// One model can be shared by several threads, which the model's lazily built
+    /// tables must not break.
+    #[test]
+    fn is_shareable_between_threads() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<Magika>();
+
+        let magika = Magika::new();
+        let expected = magika.identify_bytes(b"#!/bin/sh\necho 'Hello, world!'\n");
+        std::thread::scope(|scope| {
+            for _ in 0..4 {
+                scope.spawn(|| {
+                    let prediction = magika.identify_bytes(b"#!/bin/sh\necho 'Hello, world!'\n");
+                    assert_eq!(prediction, expected);
+                });
+            }
+        });
+    }
+}

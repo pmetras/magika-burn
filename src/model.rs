@@ -8,8 +8,14 @@
 //! 3. a convolution from 256 to 512 channels, width 5, then GELU and the maximum over positions;
 //! 4. a layer norm, a dense layer and a softmax.
 //!
-//! The convolution is about 95% of the time. `scripts/prepare_model.py` writes the weights and checks a NumPy
-//! version of this forward pass against ONNX Runtime.
+//! The convolution is almost all of the time. On x86-64 the whole pass runs through a function compiled for AVX2
+//! and FMA when the processor has them, chosen once at run time, which is about two and a half times faster than
+//! the baseline instruction set the crate is otherwise compiled for.
+//!
+//! `scripts/prepare_model.py` writes the weights and checks a NumPy version of this forward pass against ONNX
+//! Runtime.
+
+use std::sync::OnceLock;
 
 use crate::config::{INPUT_SIZE, NUM_LABELS, PADDING_TOKEN};
 
@@ -102,6 +108,28 @@ impl Weights {
 
 /// Scores one sample. `tokens` are byte values or [`PADDING_TOKEN`].
 pub(crate) fn forward(tokens: &[i32; INPUT_SIZE], scores: &mut [f32; NUM_LABELS]) {
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma") {
+        // SAFETY: guarded by the runtime detection above.
+        return unsafe { forward_avx2(tokens, scores) };
+    }
+    forward_impl::<false>(tokens, scores)
+}
+
+/// The forward pass with AVX2 and FMA. Everything it calls must inline into it:
+/// `#[target_feature]` does not reach a function that stays out of line, which
+/// would both lose the wider registers and turn `FUSED`'s `mul_add` into a call
+/// to libm's `fmaf`, two orders of magnitude slower than the fused instruction.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+fn forward_avx2(tokens: &[i32; INPUT_SIZE], scores: &mut [f32; NUM_LABELS]) {
+    forward_impl::<true>(tokens, scores)
+}
+
+/// `FUSED` says that `f32::mul_add` compiles to a single instruction, which is
+/// only true where FMA is available.
+#[inline(always)]
+fn forward_impl<const FUSED: bool>(tokens: &[i32; INPUT_SIZE], scores: &mut [f32; NUM_LABELS]) {
     let w = Weights::get();
     // The embeddings after GELU, position-major.
     let mut h = zeroed::<{ POSITIONS * CHANNELS }>();
@@ -110,7 +138,7 @@ pub(crate) fn forward(tokens: &[i32; INPUT_SIZE], scores: &mut [f32; NUM_LABELS]
     let mut x = zeroed::<{ CHANNELS * ROW }>();
     norm0(&w, &h, &mut x);
     let mut pooled = [0.0; FILTERS];
-    conv(&w, &x, &mut pooled);
+    conv::<FUSED>(&w, &x, &mut pooled);
     head(&w, &mut pooled, scores);
 }
 
@@ -130,14 +158,33 @@ fn gelu(x: f32) -> f32 {
 
 /// Embedding, bias and GELU. Token `t`'s features are channels `(t % 4) * DIM..` of position `t / 4`.
 fn embed(w: &Weights, tokens: &[i32; INPUT_SIZE], h: &mut [f32; POSITIONS * CHANNELS]) {
+    let table = embedding_table(w);
     let (outs, _) = h.as_chunks_mut::<DIM>();
     for (out, &token) in outs.iter_mut().zip(tokens) {
         let token = token.clamp(0, PADDING_TOKEN) as usize;
-        let row = &w.emb[token * DIM..][..DIM];
-        for ((out, &e), &b) in out.iter_mut().zip(row).zip(w.b0) {
-            *out = gelu(e + b);
-        }
+        out.copy_from_slice(&table[token * DIM..][..DIM]);
     }
+}
+
+/// `gelu(emb + b0)` for every token and feature.
+///
+/// Both operands are weights, so the result depends only on the token and the
+/// feature, never on the content: there are `VOCABULARY * DIM` values behind the
+/// [`INPUT_SIZE`] `* DIM` the embedding would otherwise compute per sample. This is
+/// the same arithmetic, not an approximation, so the scores are unchanged.
+fn embedding_table(w: &Weights) -> &'static [f32; VOCABULARY * DIM] {
+    static TABLE: OnceLock<Box<[f32; VOCABULARY * DIM]>> = OnceLock::new();
+    TABLE.get_or_init(|| {
+        let mut table = zeroed::<{ VOCABULARY * DIM }>();
+        let (rows, _) = table.as_chunks_mut::<DIM>();
+        for (token, row) in rows.iter_mut().enumerate() {
+            let emb = &w.emb[token * DIM..][..DIM];
+            for ((out, &e), &b) in row.iter_mut().zip(emb).zip(w.b0) {
+                *out = gelu(e + b);
+            }
+        }
+        table
+    })
 }
 
 /// Layer norm 0: each channel over the positions, scaled and shifted per position. Writes channel-major rows.
@@ -164,20 +211,36 @@ fn norm0(w: &Weights, h: &[f32; POSITIONS * CHANNELS], x: &mut [f32; CHANNELS * 
 
 /// The convolution with its bias, GELU and the maximum over the valid positions, block by block, so that the
 /// `[FILTERS][VALID]` output never exists.
-fn conv(w: &Weights, x: &[f32; CHANNELS * ROW], pooled: &mut [f32; FILTERS]) {
+///
+/// GELU is quasi-convex: it decreases to its minimum near -0.75 and increases after it, so over an interval it
+/// is largest at one of the ends, and `max_j gelu(a_j + b)` is `max(gelu(min_j a_j + b), gelu(max_j a_j + b))`.
+/// Float addition is monotonic, so the bias can be added after the reduction as well. Tracking the two extremes
+/// leaves an inner loop of `min` and `max` that vectorizes, moves the `VALID` test out of it, and calls GELU
+/// twice per filter instead of once per position. Taking only the maximum would be wrong: GELU is not monotonic,
+/// and a filter whose outputs are all negative would pick the wrong end.
+fn conv<const FUSED: bool>(w: &Weights, x: &[f32; CHANNELS * ROW], pooled: &mut [f32; FILTERS]) {
     let (pooled, _) = pooled.as_chunks_mut::<BLOCK_FILTERS>();
     for (o, best) in (0..FILTERS).step_by(BLOCK_FILTERS).zip(pooled) {
-        *best = [f32::NEG_INFINITY; BLOCK_FILTERS];
-        let biases = &w.conv_b[o..][..BLOCK_FILTERS];
+        let mut highest = [f32::NEG_INFINITY; BLOCK_FILTERS];
+        let mut lowest = [f32::INFINITY; BLOCK_FILTERS];
         for p in (0..POSITIONS).step_by(BLOCK_POSITIONS) {
-            let acc = block(w, x, o, p);
-            for ((best, acc), &bias) in best.iter_mut().zip(&acc).zip(biases) {
-                for (j, &a) in acc.iter().enumerate() {
-                    if p + j < VALID {
-                        *best = best.max(gelu(a + bias));
-                    }
+            let acc = block::<FUSED>(w, x, o, p);
+            // Only the last block has positions without a full window.
+            let valid = VALID.saturating_sub(p).min(BLOCK_POSITIONS);
+            for ((highest, lowest), acc) in highest.iter_mut().zip(&mut lowest).zip(&acc) {
+                let (mut hi, mut lo) = (*highest, *lowest);
+                for &a in &acc[..valid] {
+                    hi = hi.max(a);
+                    lo = lo.min(a);
                 }
+                (*highest, *lowest) = (hi, lo);
             }
+        }
+        let biases = &w.conv_b[o..][..BLOCK_FILTERS];
+        for ((best, (&hi, &lo)), &bias) in
+            best.iter_mut().zip(highest.iter().zip(&lowest)).zip(biases)
+        {
+            *best = gelu(hi + bias).max(gelu(lo + bias));
         }
     }
 }
@@ -185,7 +248,7 @@ fn conv(w: &Weights, x: &[f32; CHANNELS * ROW], pooled: &mut [f32; FILTERS]) {
 /// Filters `o..o + BLOCK_FILTERS` at positions `p..p + BLOCK_POSITIONS`, before the bias. The fixed-length slices let
 /// the compiler drop the bounds checks and vectorize the inner loop.
 #[inline(always)]
-fn block(
+fn block<const FUSED: bool>(
     w: &Weights,
     x: &[f32; CHANNELS * ROW],
     o: usize,
@@ -199,7 +262,12 @@ fn block(
             for (i, acc) in acc.iter_mut().enumerate() {
                 let weight = w.conv_w[((o + i) * CHANNELS + c) * WIDTH + k];
                 for (acc, &x) in acc.iter_mut().zip(xs) {
-                    *acc += weight * x;
+                    // Only fused where FMA exists; elsewhere `mul_add` is a libm call.
+                    *acc = if FUSED {
+                        weight.mul_add(x, *acc)
+                    } else {
+                        *acc + weight * x
+                    };
                 }
             }
         }
